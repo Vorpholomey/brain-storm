@@ -1,0 +1,27 @@
+{
+	"mcpServers": {"playwright": {
+			"command": "npx",
+			"args": [
+				"-y",
+				"@playwright/mcp@0.0.38"
+			],
+			"alwaysAllow": [
+				"browser_take_screenshot",
+				"browser_navigate",
+				"browser_console_messages",
+				"browser_wait_for"
+			]
+		},
+		"context7": {
+			"type": "streamable-http",
+			"url": "https://mcp.context7.com/mcp",
+			"headers": {
+				"Authorization": "Bearer ctx7sk-06d6f0df-e1e8-4400-a105-14ca7707a4af"
+			},
+			"alwaysAllow": [
+				"resolve-library-id",
+				"query-docs"
+			]
+		}
+	}
+}

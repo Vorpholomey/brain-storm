@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SessionMode {
+  QUICK
+  TEAM
+  ASYNC
+  PERSONAL
+}
+
+enum IdeaStatus {
+  DRAFT
+  DISCUSSION
+  FINALIST
+  SELECTED
+}
+
+enum SessionStage {
+  DISCUSSION
+  VOTING_ROUND_1
+  REFINEMENT
+  FINAL_VOTE
+  COMPLETED
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  passwordHash   String
+  createdAt      DateTime  @default(now())
+  organizedSessions Session[] @relation("SessionOrganizer")
+  authoredIdeas   Idea[]    @relation("IdeaAuthor")
+  votes           Vote[]    @relation("VoteUser")
+  comments        Comment[] @relation("CommentUser")
+}
+
+model Session {
+  id             String        @id @default(cuid())
+  organizerId    String
+  organizer      User          @relation("SessionOrganizer", fields: [organizerId], references: [id])
+  topic          String
+  mode           SessionMode
+  config         Json
+  status         String
+  currentStage   SessionStage  @default(DISCUSSION)
+  stageDeadline  DateTime?
+  selectedIdeaId String?
+  nextSteps      Json?
+  sessionSummary String?
+  createdAt      DateTime      @default(now())
+  ideas          Idea[]
+
+  @@index([organizerId])
+}
+
+model Idea {
+  id        String     @id @default(cuid())
+  sessionId String
+  session   Session    @relation(fields: [sessionId], references: [id])
+  authorId  String
+  author    User       @relation("IdeaAuthor", fields: [authorId], references: [id])
+  title     String
+  content   String
+  status    IdeaStatus @default(DRAFT)
+  createdAt DateTime   @default(now())
+  votes     Vote[]
+  comments  Comment[]
+
+  @@index([sessionId])
+  @@index([authorId])
+}
+
+model Vote {
+  id        String   @id @default(cuid())
+  ideaId    String
+  idea      Idea     @relation(fields: [ideaId], references: [id])
+  userId    String
+  user      User     @relation("VoteUser", fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([ideaId, userId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  ideaId    String
+  idea      Idea     @relation(fields: [ideaId], references: [id])
+  userId    String
+  user      User     @relation("CommentUser", fields: [userId], references: [id])
+  text      String
+  createdAt DateTime @default(now())
+}
