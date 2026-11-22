@@ -1,167 +1,281 @@
-import { FastifyPluginAsync } from 'fastify';
-import { createIdeaSchema, updateIdeaSchema } from '../schemas/idea.schema';
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { authMiddleware } from '@/middleware/auth';
+import { validate } from '@/middleware/validate';
+import { createLogger } from '@/lib/logger';
+import {
+  createIdea,
+  updateIdea,
+  selectIdea,
+  addComment,
+  structureFromChat,
+  getIdeasForSession,
+  getIdeaWithComments,
+} from '@/services/ideaService';
 
-const ideasRoutes: FastifyPluginAsync = async (fastify) => {
-  // GET /sessions/:sessionId/ideas — получение всех идей сессии с количеством голосов
-  fastify.get('/:sessionId/ideas', async (request, reply) => {
-    const { sessionId } = request.params as { sessionId: string };
-    const userId = (request.user as { sub: string }).sub;
+const logger = createLogger({ module: 'ideas' });
 
-    // Проверка существования сессии
-    const session = await fastify.prisma.session.findUnique({
-      where: { id: sessionId },
-    });
+// ========================================
+// Zod схемы валидации
+// ========================================
 
-    if (!session) {
-      return reply.status(404).send({ error: 'Session not found' });
-    }
+const createIdeaSchema = z.object({
+  title: z.string().min(1).max(200),
+  content: z.string().min(1).max(5000),
+  sessionId: z.string().min(1),
+});
 
-    // Проверка доступа: организатор ИЛИ участник (автор хотя бы одной идеи)
-    if (session.organizerId !== userId) {
-      const ideaCount = await fastify.prisma.idea.count({
-        where: { sessionId, authorId: userId },
-      });
+const updateIdeaSchema = z
+  .object({
+    title: z.string().min(1).max(200).optional(),
+    content: z.string().min(1).max(5000).optional(),
+  })
+  .refine((data) => data.title !== undefined || data.content !== undefined, {
+    message: 'At least one field (title or content) must be provided',
+  });
 
-      if (ideaCount === 0) {
-        return reply.status(403).send({ error: 'No access to this session' });
+const commentSchema = z.object({
+  text: z.string().min(1).max(1000),
+});
+
+const structureFromChatSchema = z.object({
+  sessionId: z.string().min(1),
+  chatText: z.string().min(1),
+});
+
+const ideaIdSchema = z.object({
+  id: z.string().min(1),
+});
+
+// ========================================
+// Регистрация маршрутов
+// ========================================
+
+export async function registerIdeaRoutes(fastify: FastifyInstance) {
+  await fastify.register(async (router) => {
+    // Все маршруты идей требуют аутентификации
+    router.addHook('onRequest', authMiddleware);
+
+    const prefix = '/ideas';
+
+    // POST /ideas — Создание идеи (только в стадии DISCUSSION)
+    router.post(
+      prefix,
+      {
+        preHandler: validate(createIdeaSchema, 'body'),
+      },
+      async (request, _reply) => {
+        const userId = request.user!.userId;
+        const { title, content, sessionId } = request.body as {
+          title: string;
+          content: string;
+          sessionId: string;
+        };
+
+        const idea = await createIdea(sessionId, userId, title, content);
+
+        logger.info({ ideaId: idea.id, userId }, 'Idea created via REST');
+
+        return {
+          id: idea.id,
+          title: idea.title,
+          content: idea.content,
+          authorId: idea.authorId,
+          author: idea.author,
+          sessionId: idea.sessionId,
+          status: idea.status,
+          selectedAt: idea.selectedAt?.toISOString() ?? null,
+          createdAt: idea.createdAt.toISOString(),
+          updatedAt: idea.updatedAt.toISOString(),
+        };
       }
-    }
+    );
 
-    // Получаем идеи с количеством голосов
-    const ideas = await fastify.prisma.idea.findMany({
-      where: { sessionId },
-      include: {
-        _count: {
-          select: { votes: true },
-        },
-        author: {
-          select: {
-            id: true,
-            email: true,
-          },
-        },
-      },
-      orderBy: {
-        createdAt: 'asc',
-      },
+    // GET /ideas?sessionId=... — Список идей сессии
+    router.get(`${prefix}`, async (request) => {
+      const { sessionId } = request.query as { sessionId?: string };
+
+      if (!sessionId) {
+        const error = new Error('sessionId query parameter is required') as Error & {
+          code?: string;
+          statusCode?: number;
+        };
+        error.code = 'VALIDATION_ERROR';
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const ideas = await getIdeasForSession(sessionId);
+
+      return ideas.map((idea: any) => ({
+        id: idea.id,
+        title: idea.title,
+        content: idea.content,
+        authorId: idea.authorId,
+        author: idea.author,
+        sessionId: idea.sessionId,
+        status: idea.status,
+        selectedAt: idea.selectedAt?.toISOString() ?? null,
+        createdAt: idea.createdAt.toISOString(),
+        updatedAt: idea.updatedAt.toISOString(),
+        votes: idea.votes.map((v: any) => ({
+          id: v.id,
+          userId: v.userId,
+          user: v.user,
+          createdAt: v.createdAt.toISOString(),
+        })),
+        comments: idea.comments.map((c: any) => ({
+          id: c.id,
+          text: c.text,
+          userId: c.userId,
+          user: c.user,
+          createdAt: c.createdAt.toISOString(),
+        })),
+      }));
     });
 
-    const ideasWithVoteCount = ideas.map((idea) => ({
-      ...idea,
-      voteCount: idea._count.votes,
-      _count: undefined,
-    }));
+    // GET /ideas/:id — Детали идеи с комментариями
+    router.get(
+      `${prefix}/:id`,
+      {
+        preHandler: validate(ideaIdSchema, 'params'),
+      },
+      async (request) => {
+        const { id } = request.params as { id: string };
 
-    return reply.status(200).send(ideasWithVoteCount);
+        const idea = await getIdeaWithComments(id);
+
+        return {
+          id: idea.id,
+          title: idea.title,
+          content: idea.content,
+          authorId: idea.authorId,
+          author: idea.author,
+          sessionId: idea.sessionId,
+          status: idea.status,
+          selectedAt: idea.selectedAt?.toISOString() ?? null,
+          createdAt: idea.createdAt.toISOString(),
+          updatedAt: idea.updatedAt.toISOString(),
+          comments: idea.comments.map((c: any) => ({
+            id: c.id,
+            text: c.text,
+            userId: c.userId,
+            user: c.user,
+            createdAt: c.createdAt.toISOString(),
+          })),
+        };
+      }
+    );
+
+    // PATCH /ideas/:id — Обновление идеи (только автор или организатор, в стадии REFINEMENT)
+    router.patch(
+      `${prefix}/:id`,
+      {
+        preHandler: [
+          validate(ideaIdSchema, 'params'),
+          validate(updateIdeaSchema, 'body'),
+        ],
+      },
+      async (request) => {
+        const userId = request.user!.userId;
+        const { id } = request.params as { id: string };
+        const { title, content } = request.body as {
+          title?: string;
+          content?: string;
+        };
+
+        const idea = await updateIdea(id, userId, { title, content });
+
+        logger.info({ ideaId: id, userId }, 'Idea updated via REST');
+
+        return {
+          id: idea.id,
+          title: idea.title,
+          content: idea.content,
+          authorId: idea.authorId,
+          author: idea.author,
+          sessionId: idea.sessionId,
+          status: idea.status,
+          selectedAt: idea.selectedAt?.toISOString() ?? null,
+          createdAt: idea.createdAt.toISOString(),
+          updatedAt: idea.updatedAt.toISOString(),
+        };
+      }
+    );
+
+    // POST /ideas/:id/select — Выбор идеи (только владелец сессии, режим PERSONAL)
+    router.post(
+      `${prefix}/:id/select`,
+      {
+        preHandler: validate(ideaIdSchema, 'params'),
+      },
+      async (request) => {
+        const userId = request.user!.userId;
+        const { id } = request.params as { id: string };
+
+        const idea = await selectIdea(id, userId);
+
+        logger.info({ ideaId: id, userId }, 'Idea selected via REST');
+
+        return {
+          id: idea.id,
+          title: idea.title,
+          content: idea.content,
+          authorId: idea.authorId,
+          author: idea.author,
+          sessionId: idea.sessionId,
+          status: idea.status,
+          selectedAt: idea.selectedAt?.toISOString() ?? null,
+          createdAt: idea.createdAt.toISOString(),
+          updatedAt: idea.updatedAt.toISOString(),
+        };
+      }
+    );
+
+    // POST /ideas/:id/comments — Добавление комментария к идее
+    router.post(
+      `${prefix}/:id/comments`,
+      {
+        preHandler: [
+          validate(ideaIdSchema, 'params'),
+          validate(commentSchema, 'body'),
+        ],
+      },
+      async (request) => {
+        const userId = request.user!.userId;
+        const { id } = request.params as { id: string };
+        const { text } = request.body as { text: string };
+
+        const comment = await addComment(id, userId, text);
+
+        logger.info({ commentId: comment.id, ideaId: id, userId }, 'Comment added via REST');
+
+        return {
+          id: comment.id,
+          text: comment.text,
+          userId: comment.userId,
+          user: comment.user,
+          ideaId: comment.ideaId,
+          createdAt: comment.createdAt.toISOString(),
+        };
+      }
+    );
+
+    // POST /ideas/from-chat — Структурирование идеи из текста чата через LLM
+    router.post(
+      `${prefix}/from-chat`,
+      {
+        preHandler: validate(structureFromChatSchema, 'body'),
+      },
+      async (request) => {
+        const { chatText } = request.body as { sessionId: string; chatText: string };
+
+        const result = await structureFromChat(chatText);
+
+        logger.info({ chatTextLength: chatText.length }, 'Idea structured from chat via REST');
+
+        return result;
+      }
+    );
   });
-
-  // POST /sessions/:sessionId/ideas — создание новой идеи
-  fastify.post('/:sessionId/ideas', async (request, reply) => {
-    const { sessionId } = request.params as { sessionId: string };
-    const userId = (request.user as { sub: string }).sub;
-    const body = createIdeaSchema.parse(request.body);
-
-    // Проверка существования сессии и этапа
-    const session = await fastify.prisma.session.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      return reply.status(404).send({ error: 'Session not found' });
-    }
-
-    // Идеи можно создавать только на этапе DISCUSSION
-    if (session.currentStage !== 'DISCUSSION') {
-      return reply.status(400).send({ error: 'Ideas can only be created during DISCUSSION stage' });
-    }
-
-    const idea = await fastify.prisma.idea.create({
-      data: {
-        sessionId,
-        authorId: userId,
-        title: body.title,
-        content: body.content,
-        status: 'DRAFT',
-      },
-      include: {
-        author: {
-          select: {
-            id: true,
-            email: true,
-          },
-        },
-      },
-    });
-
-    return reply.status(201).send(idea);
-  });
-
-  // PATCH /sessions/:sessionId/ideas/:ideaId — редактирование идеи
-  fastify.patch('/:sessionId/ideas/:ideaId', async (request, reply) => {
-    const { sessionId, ideaId } = request.params as { sessionId: string; ideaId: string };
-    const userId = (request.user as { sub: string }).sub;
-    const body = updateIdeaSchema.parse(request.body);
-
-    // Получаем сессию для проверки доступа
-    const session = await fastify.prisma.session.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      return reply.status(404).send({ error: 'Session not found' });
-    }
-
-    // Получаем идею
-    const idea = await fastify.prisma.idea.findUnique({
-      where: { id: ideaId },
-    });
-
-    if (!idea) {
-      return reply.status(404).send({ error: 'Idea not found' });
-    }
-
-    // Проверка что идея принадлежит сессии
-    if (idea.sessionId !== sessionId) {
-      return reply.status(404).send({ error: 'Idea not found in this session' });
-    }
-
-    // Проверка доступа: автор идеи ИЛИ организатор сессии
-    if (idea.authorId !== userId && session.organizerId !== userId) {
-      return reply.status(403).send({ error: 'Only the author or organizer can edit this idea' });
-    }
-
-    // Редактирование только когда идея имеет статус FINALIST (этап REFINEMENT)
-    if (idea.status !== 'FINALIST') {
-      return reply.status(400).send({ error: 'Ideas can only be edited when they are FINALIST status' });
-    }
-
-    const updatedIdea = await fastify.prisma.idea.update({
-      where: { id: ideaId },
-      data: {
-        ...(body.title !== undefined && { title: body.title }),
-        ...(body.content !== undefined && { content: body.content }),
-      },
-      include: {
-        author: {
-          select: {
-            id: true,
-            email: true,
-          },
-        },
-        _count: {
-          select: { votes: true },
-        },
-      },
-    });
-
-    const result = {
-      ...updatedIdea,
-      voteCount: updatedIdea._count.votes,
-      _count: undefined,
-    };
-
-    return reply.status(200).send(result);
-  });
-};
-
-export default ideasRoutes;
+}

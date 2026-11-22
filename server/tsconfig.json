@@ -1,21 +1,23 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "CommonJS",
-    "moduleResolution": "node",
-    "declaration": true,
-    "sourceMap": true,
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
     "outDir": "./dist",
     "rootDir": "./src",
-    "strict": true,
-    "skipLibCheck": true,
     "esModuleInterop": true,
+    "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"],
+    "resolveJsonModule": true,
     "baseUrl": ".",
     "paths": {
-      "@prisma/client": ["./node_modules/.prisma/client"]
-    }
+      "@/*": ["./src/*"],
+      "@shared/*": ["../shared/*"]
+    },
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

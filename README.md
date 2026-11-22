@@ -1,339 +1,737 @@
 # Brain Storm
 
-Монорепозиторий с npm workspaces. Веб-приложение с клиентом на React + Vite и сервером на Fastify 4 + TypeScript + Prisma.
+Платформа для организации мозговых штурмов. Организатор создаёт сессии по заданной теме, участники предлагают идеи, голосуют за них, комментируют и обсуждают. Система поддерживает несколько режимов (QUICK, TEAM, ASYNC, PERSONAL), многоступенчатое голосование с выделением финалистов, а также асинхронную работу и личные сессии.
 
-## Структура
+## Режимы сессий
 
-- `client/` — React + Vite фронтенд
-- `server/` — Fastify бэкенд
-- `shared/` — общие типы и утилиты
+| Режим | Описание |
+|-------|----------|
+| **QUICK** | Быстрый режим — стандартный сценарий: обсуждение → голосование → доработка → финал. Подходит для одиночной работы или небольших команд в реальном времени. |
+| **TEAM** | Командный режим — стандартный сценарий с акцентом на совместную работу: все участники видят presence (кто онлайн), голоса других, могут обсуждать в комментариях. |
+| **ASYNC** | Асинхронный режим — участники работают в своём темпе. Вместо обратного отсчёта отображается блок дедлайнов [`DeadlinesBlock`](client/src/components/room/DeadlinesBlock.tsx:1) с абсолютными датами/времени для каждого этапа. При просрочке дедлайна появляется предупреждение, но участник может оставить поздний голос. |
+| **PERSONAL** | Личный режим — скрытие presence и голосов других участников. Доступен блок заметок [`NotesPanel`](client/src/components/room/NotesPanel.tsx:1) (сохраняется в localStorage). На каждой идее появляется кнопка «Выбрать» для отметки понравившихся идей. Организатор может выбрать финальную идею через `POST /ideas/:id/select`. |
 
-## Сервер
+## Стек
 
-### Зависимости
-- Fastify 4
-- Prisma (ORM)
-- Zod (валидация)
-- @fastify/jwt, @fastify/cookie, @fastify/cors
-- bcryptjs (хеширование паролей)
-- socket.io (WebSocket)
+- **Node.js 20** + **TypeScript** (strict mode)
+- **Fastify** — HTTP-фреймворк
+- **PostgreSQL 16** — реляционная база данных
+- **Prisma** — ORM и миграции
+- **@fastify/websocket** — WebSocket для реального времени
+- **JWT** (jsonwebtoken) — аутентификация (access + refresh токены)
+- **Zod** — валидация входных данных
+- **Pino** — логирование
+- **Vitest** — тесты
+- **bcryptjs** — хеширование паролей
 
-### Аутентификация
+## Структура проекта
 
-#### POST /auth — регистрация
-- Валидация через RegisterSchema (email, password мин. 8 символов)
-- Проверка уникальности email (409 если занят)
-- Хеширование пароля через bcryptjs
-- Создание пользователя в БД
-- Ответ 201: `{ accessToken, user: { id, email, createdAt } }`
-
-#### POST /auth/login — авторизация
-- Валидация через LoginSchema (email, password)
-- Поиск пользователя по email, проверка пароля
-- Ответ 401 при неверных данных
-- Генерация access и refresh токенов
-- Refresh токен устанавливается в httpOnly cookie
-- Ответ 200: `{ accessToken }`
-
-#### GET /health — health check
-- Ответ: `{ status: 'ok' }`
-
-### Сессии (защищённые роуты, требуют JWT)
-
-#### POST /sessions — создание сессии
-- Валидация через CreateSessionSchema (topic, mode, config)
-- organizerId берётся из JWT токена (`request.user.sub`)
-- Создание сессии в БД со статусом `ACTIVE`
-- Ответ 201: созданная сессия
-
-#### GET /sessions/:id — получение сессии с проверкой доступа
-- Поиск сессии по ID
-- Ответ 404 если сессия не найдена
-- Проверка доступа:
-  - Органайзер сессии (`session.organizerId === userId`) — доступ разрешён
-  - Участники, у которых есть идея в сессии — доступ разрешён
-  - В остальных случаях — 403 `{ error: 'Нет доступа к сессии' }`
-- Ответ 200: сессия
-
-#### POST /sessions/:id/advance — переход к следующему этапу сессии
-- Только организатор сессии может вызвать этот endpoint (403 для остальных)
-- Вызывает сервис `advanceStage` для перехода к следующему этапу
-- Отправляет WebSocket событие `stage_advanced` всем участникам сессии
-- Ответ 200: `{ session, stage, stageDeadline }`
-
-#### GET /sessions/:id/result — получение результата завершённой сессии
-- Проверка доступа: организатор ИЛИ участник сессии (403 при отсутствии доступа)
-- Если `selectedIdeaId` задан, возвращает связанную идею (`title`, `content`)
-- Возвращает `nextSteps` (массив строк или пустой массив), `sessionSummary` (текст или null)
-- Ответ 200: `{ selectedIdea: { title, content } | null, nextSteps: string[], sessionSummary: string | null }`
-
-#### PATCH /sessions/:id/result — сохранение результата завершённой сессии
-- Только организатор сессии может вызвать этот endpoint (403 для остальных)
-- Валидация через `UpdateSessionResultSchema`: `{ nextSteps?: string[], sessionSummary?: string }`
-- `nextSteps` — массив непустых строк (макс. 50 элементов)
-- `sessionSummary` — строка (макс. 5000 символов)
-- Сохраняет переданные поля в сессию (остальные поля не меняются)
-- Ответ 200: `{ nextSteps: string[], sessionSummary: string | null }`
-
-### Идеи (защищённые роуты, требуют JWT)
-
-#### GET /sessions/:sessionId/ideas — получение всех идей сессии с количеством голосов
-- Проверка существования сессии (404 если не найдена)
-- Проверка доступа: организатор сессии ИЛИ пользователь, у которого есть хотя бы одна идея в сессии (403 при отсутствии доступа)
-- Возвращает все идеи сессии с `voteCount` (количество голосов) и информацией об авторе
-- Ответ 200: массив идей с полями `id`, `title`, `content`, `status`, `voteCount`, `author`, `createdAt`
-
-#### POST /sessions/:sessionId/ideas — создание новой идеи
-- Валидация через `createIdeaSchema`: `{ title: string (1-200), content: string (1-5000) }`
-- Проверка что сессия в этапе DISCUSSION (400 если нет)
-- authorId берётся из JWT токена, status автоматически устанавливается DRAFT
-- Ответ 201: созданная идея с информацией об авторе
-
-#### PATCH /sessions/:sessionId/ideas/:ideaId — редактирование идеи
-- Валидация через `updateIdeaSchema`: `{ title?: string, content?: string }`, хотя бы одно поле обязательно
-- Проверка доступа: только автор идеи ИЛИ организатор сессии (403 для остальных)
-- Редактирование возможно только когда idea.status === FINALIST (этап REFINEMENT, 400 иначе)
-- Ответ 200: обновлённая идея с `voteCount`
-
-### Голосование (защищённые роуты, требуют JWT)
-
-#### POST /sessions/:sessionId/vote — финальное голосование за идею
-- Валидация через `finalVoteSchema`: `{ ideaId: string }`
-- Проверки:
-  1. Сессия в этапе FINAL_VOTE (400 если нет)
-  2. Идея имеет статус FINALIST (400 если нет)
-  3. Пользователь ещё не проголосовал за НИ ОДНУ из идей-финалистов в этой сессии (409 Conflict если уже голосовал)
-- "1 голос на финальное голосование" проверяется на уровне БД: пользователь может проголосовать только за ОДНУ идею среди всех финалистов
-- Отправляет WebSocket событие `new_vote` всем участникам сессии
-- Ответ 201: созданный голос
-
-#### GET /sessions/:sessionId/finalists — получение всех финалистов с количеством голосов
-- Проверка доступа: организатор ИЛИ участник (403 при отсутствии доступа)
-- Возвращает все идеи-финалисты с `voteCount` и флагом `hasVoted` (проголосовал ли текущий пользователь за эту идею)
-- Отсортировано по количеству голосов (по убыванию)
-- Ответ 200: массив финалистов
-
-### Система этапов сессий (Session Stages)
-
-Каждая сессия проходит через серию этапов, управляемых организатором:
-
-#### Этапы (SessionStage enum)
-1. **DISCUSSION** — обсуждение, участники предлагают идеи
-2. **VOTING_ROUND_1** — первый раунд голосования за идеи
-3. **REFINEMENT** — уточнение топ-3 идей (автоматически выбираются по количеству голосов)
-4. **FINAL_VOTE** — финальное голосование
-5. **COMPLETED** — завершённая сессия, победитель определён
-
-#### Переходы между этапами
-- Организатор вызывает `POST /sessions/:id/advance` для перехода к следующему этапу
-- При переходе от DISCUSSION → VOTING_ROUND_1: все идеи со статусом DRAFT become DISCUSSION
-- При переходе от VOTING_ROUND_1 → REFINEMENT: топ-3 идеи по голосам получают статус FINALIST
-- При переходе от REFINEMENT → FINAL_VOTE: начинается финальное голосование
-- При переходе от FINAL_VOTE → COMPLETED: идея с максимумом голосов получает статус SELECTED
-
-#### Длительности этапов
-По умолчанию (в миллисекундах):
-- voting: 30 минут
-- refinement: 15 минут
-- finalVote: 20 минут
-
-Можно настроить через `config.stageDurations` при создании сессии.
-
-### Запуск
-
-```bash
-# Установка зависимостей
-npm install
-
-# Запуск сервера в dev-режиме
-npm --workspace=@brain-storm/server run dev
+```
+brain-storm/
+├── server/                  # Бэкенд-сервер
+│   ├── prisma/
+│   │   └── schema.prisma    # Схема базы данных (Prisma)
+│   ├── src/
+│   │   ├── index.ts         # Точка входа, инициализация Fastify
+│   │   ├── db/
+│   │   │   └── client.ts    # Prisma Client
+│   │   ├── lib/
+│   │   │   ├── jwt.ts       # Генерация и верификация JWT
+│   │   │   ├── logger.ts    # Настройка Pino
+│   │   │   └── password.ts  # Хеширование / сравнение паролей
+│   │   ├── middleware/
+│   │   │   ├── auth.ts      # Проверка JWT-аутентификации
+│   │   │   ├── errorHandler.ts  # Глобальный обработчик ошибок
+│   │   │   └── validate.ts  # Валидация запросов через Zod
+│   │   ├── services/
+│   │   │   └── sessionService.ts  # Бизнес-логика сессий
+│   │   ├── ws/
+│   │   │   ├── socket.ts    # Настройка WebSocket (@fastify/websocket)
+│   │   │   ├── handlers.ts  # Обработчики событий (join, leave, idea, vote)
+│   │   │   └── rooms.ts     # Управление комнатами и онлайн-пользователями
+│   │   └── routes/
+│   │       ├── auth.ts      # Эндпоинты аутентификации
+│   │       └── sessions.ts  # REST API сессий
+│   ├── .env.example         # Пример переменных окружения
+│   ├── package.json
+│   └── tsconfig.json
+└── shared/
+    └── types.ts             # Общие TypeScript-типы (User, Session, Idea, Vote, Comment и т.д.)
 ```
 
-### Плагины
+## Быстрый старт
 
-- [`prisma.ts`](server/src/plugins/prisma.ts) — подключение PrismaClient, декорация `fastify.prisma`
-- [`jwt.ts`](server/src/plugins/jwt.ts) — @fastify/jwt для access токенов + декоратор `fastify.jwtRefreshSign` для refresh токенов
-- [`auth.ts`](server/src/plugins/auth.ts) — middleware проверки JWT (onRequest hook)
-- [`cors.ts`](server/src/plugins/cors.ts) — настройка CORS
-- [`socket.io.ts`](server/src/plugins/socket.io.ts) — интеграция Socket.IO с Fastify, декорация `fastify.io`
+```bash
+# 1. Скопируйте файл окружения
+cp server/.env.example server/.env
 
-### Socket.IO
+# 2. Установите зависимости
+cd server && npm install
 
-Сервер поддерживает WebSocket-соединения через Socket.IO для реального времени в сессиях мозгового штурма.
+# 3. Сгенерируйте Prisma Client
+npx prisma generate
 
-#### Клиентские события
+# 4. Запустите миграции базы данных
+npx prisma migrate dev
 
-- **`join_session(sessionId)`** — присоединение к сессии
-  - JWT токен берётся из `socket.handshake.auth.token` или `socket.handshake.query.token`
-  - Проверяется подпись токена и совпадение `sessionId` из payload с переданным `sessionId`
-  - При успехе socket присоединяется к room с именем `sessionId`
-  - При ошибке отправляется событие `error` с сообщением
+# 5. Запустите сервер в режиме разработки
+npm run dev
+```
 
-- **`leave_session()`** — выход из сессии
-  - Отписывает socket от room
-  - Очищает данные сессии (sessionId, userId)
+Сервер будет доступен по адресу `http://localhost:3000`.
 
-- **`cast_vote(ideaId, callback)`** — голосование за идею
-  - Проверяет, что идея принадлежит текущей сессии пользователя
-  - Проверяет лимит голосов (`voteLimit` в config сессии, по умолчанию 10)
-  - Создаёт запись `Vote` в БД (уникальное ограничение ideaId + userId)
-  - Отправляет `vote_updated` всем участникам сессии с новым количеством голосов
-  - Вызывает `callback()` при успехе или `callback(error)` при ошибке
-  - При повторном голосовании за ту же идею — ошибка `P2002` → `vote_rejected`
+### Настройка прокси фронтенда
 
-#### Серверные события (отправляются в room)
+Фронтенд (Vite) работает на порту 5173 и использует прокси для пересылки API-запросов на бэкенд. В [`vite.config.ts`](client/vite.config.ts) настроена опция `rewrite`, которая удаляет префикс `/api` при пересылке запроса на сервер:
 
-- **`vote_updated({ ideaId, voteCount })`** — обновлены голоса после голосования
-- **`vote_rejected(reason)`** — голос отклонён с указанием причины
-- **`idea_added`** — добавлена новая идея
-- **`session_status_changed`** — изменён статус сессии
+```ts
+server: {
+  proxy: {
+    '/api': {
+      target: 'http://localhost:3000',
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/api/, ''),
+    },
+  },
+},
+```
 
-#### Использование на сервере
+Таким образом, запрос с клиента `POST /api/auth/login` превращается в `POST /auth/login` на бэкенде.
+
+## API Endpoints
+
+### Аутентификация (`/auth`)
+
+| Метод   | Путь            | Описание                        | Аутентификация |
+|---------|-----------------|---------------------------------|----------------|
+| POST    | `/auth/register` | Регистрация нового пользователя | Нет            |
+| POST    | `/auth/login`    | Вход по email + пароль          | Нет            |
+| POST    | `/auth/refresh`  | Обновление access-токена        | Нет (refresh-токен в cookie) |
+| POST    | `/auth/logout`   | Выход (удаление refresh-токена) | Да (опционально) |
+| GET     | `/auth/me`       | Получить данные текущего пользователя | Да       |
+
+### Сессии (`/sessions`)
+
+Все endpoints требуют аутентификации (access-токен в cookie).
+
+| Метод   | Путь                | Описание                                                    | Аутентификация |
+|---------|---------------------|-------------------------------------------------------------|----------------|
+| POST    | `/sessions`         | Создать сессию (topic, mode, config)                        | Да             |
+| GET     | `/sessions`         | Список сессий пользователя (где он участник или организатор) | Да             |
+| GET     | `/sessions/:id`     | Детали сессии (идеи, голоса, участники)                     | Да             |
+| POST    | `/sessions/:id/join`| Присоединиться к сессии (идемпотентно)                      | Да             |
+| POST    | `/sessions/:id/start`| Запустить сессию (только организатор)                       | Да             |
+| POST    | `/sessions/:id/advance`| Перейти к следующему этапу (только организатор)          | Да             |
+
+#### Создание сессии — валидация config
+
+| Поле                      | Тип    | Ограничения             |
+|---------------------------|--------|-------------------------|
+| `config.voteLimit`        | number | 1–10                    |
+| `config.finalistsCount`   | number | 1–10                    |
+| `config.discussionDurationMin` | number | > 0                   |
+| `config.votingDurationMin`    | number | > 0                   |
+| `config.refinementDurationMin`| number| > 0                   |
+| `mode`                    | string | QUICK, TEAM, ASYNC, PERSONAL |
+
+### WebSocket (`/ws`)
+
+Подключение через WebSocket к `ws://localhost:3000/ws?token=<access_token>`.
+
+Токен также можно передать в cookie `access_token`.
+
+#### Клиент → Сервер
+
+| Событие        | Payload                                    | Описание                           |
+|----------------|--------------------------------------------|------------------------------------|
+| `join_session` | `{ sessionId: string }`                    | Присоединиться к комнате сессии    |
+| `leave_session`| `{ sessionId?: string }`                   | Выйти из комнаты                   |
+| `create_idea`  | `{ title: string, content: string }`       | Создать идею в текущей сессии      |
+| `cast_vote`    | `{ ideaId: string }`                       | Подать голос за идею               |
+
+#### Сервер → Клиент
+
+| Событие          | Payload                                    | Описание                           |
+|------------------|--------------------------------------------|------------------------------------|
+| `session_state`  | `{ ...session, ideas, members, onlineUsers }` | Текущее состояние сессии (при join) |
+| `online_users`   | `{ onlineUsers: string[] }`                | Обновление списка онлайн-участников|
+| `idea_created`   | `{ idea: Idea }`                           | Новая идея создана                 |
+| `vote_updated`   | `{ ideaId: string, votesCount: number }`   | Обновление счётчика голосов идеи   |
+| `vote_rejected`  | `{ code: string, message: string }`        | Отклонение голоса с кодом ошибки   |
+| `left_session`   | `{ sessionId: string }`                    | Подтверждение выхода               |
+| `stage_changed`  | `{ currentStage: string, stageDeadline: string }` | Изменение этапа сессии        |
+| `error`          | `{ message: string, code: string }`        | Ошибка                             |
+
+Access-токен передаётся в заголовке `Authorization: Bearer <token>` или в cookie.
+Refresh-токен хранится в httpOnly-cookie.
+
+### Идеи (`/ideas`)
+
+Все эндпоинты требуют JWT аутентификации.
+
+| Метод   | Путь                        | Описание                                      | Стадия сессии | Права доступа           |
+|---------|-----------------------------|-----------------------------------------------|---------------|-------------------------|
+| POST    | `/ideas`                    | Создание идеи                                 | DISCUSSION    | Любой участник сессии   |
+| GET     | `/ideas?sessionId=`         | Список идей сессии                            | —             | Любой участник          |
+| GET     | `/ideas/:id`                | Детали идеи с комментариями                  | —             | Любой участник          |
+| PATCH   | `/ideas/:id`                | Обновление идеи (title, content)              | REFINEMENT    | Автор или организатор   |
+| POST    | `/ideas/:id/select`         | Выбор идеи организатором                      | PERSONAL      | Только организатор      |
+| POST    | `/ideas/:id/comments`       | Добавление комментария                       | —             | Любой участник          |
+| POST    | `/ideas/from-chat`          | Структурирование идеи из чата через LLM       | —             | Любой участник          |
+
+#### Валидация
+
+| Поле        | Тип    | Ограничения            |
+|-------------|--------|------------------------|
+| `title`     | string | 1–200 символов         |
+| `content`   | string | 1–5000 символов        |
+| `text`      | string | 1–1000 символов (комментарий) |
+
+#### Структурирование через LLM
+
+Эндпоинт `/ideas/from-chat` принимает текст чата и возвращает структурированную идею `{ title, content }` без сохранения в БД. Клиент должен подтвердить публикацию отдельно через `POST /ideas`.
+
+Таймаут LLM запроса: 5 секунд. При таймауте возвращается ошибка 504.
+
+## Модель данных
+
+### User
+| Поле           | Тип      | Описание                    |
+|----------------|----------|-----------------------------|
+| id             | String   | Уникальный идентификатор (cuid) |
+| email          | String   | Уникальный email            |
+| passwordHash   | String   | Хешированный пароль         |
+| createdAt      | DateTime | Дата создания               |
+
+### Session
+| Поход           | Тип        | Описание                           |
+|-----------------|------------|------------------------------------|
+| id              | String     | Уникальный идентификатор           |
+| organizerId     | String     | ID организатора (ссылка на User)   |
+| topic           | String     | Тема сессии                        |
+| mode            | SessionMode | Режим: QUICK, TEAM, ASYNC, PERSONAL |
+| config          | Json       | Настройки (voteLimit, finalistsCount, таймеры) |
+| currentStage    | SessionStage | Текущий этап сессии               |
+| stageDeadline   | DateTime?  | Дедлайн текущего этапа             |
+| selectedIdeaId  | String?    | ID выбранной идеи                  |
+| status          | SessionStatus | Статус: ACTIVE, COMPLETED, ARCHIVED |
+| createdAt       | DateTime   | Дата создания                      |
+
+### Idea
+| Поле           | Тип        | Описание                    |
+|----------------|------------|-----------------------------|
+| id             | String     | Уникальный идентификатор    |
+| sessionId      | String     | ID сессии                   |
+| authorId       | String     | ID автора (ссылка на User)  |
+| title          | String     | Заголовок идеи              |
+| content        | String     | Описание идеи               |
+| status         | IdeaStatus | DRAFT, DISCUSSION, FINALIST, SELECTED |
+| createdAt      | DateTime   | Дата создания               |
+
+### Vote
+| Поле           | Тип      | Описание                    |
+|----------------|----------|-----------------------------|
+| id             | String   | Уникальный идентификатор    |
+| ideaId         | String   | ID идеи                     |
+| userId         | String   | ID пользователя             |
+| createdAt      | DateTime | Дата голосования            |
+
+Уникальность: каждая тройка `(sessionId, userId, ideaId)` — уникальна (один голос на пользователя за идею в сессии).
+
+### SessionMember
+
+| Поле           | Тип        | Описание                    |
+|----------------|------------|-----------------------------|
+| id             | String     | Уникальный идентификатор    |
+| sessionId      | String     | ID сессии                   |
+| userId         | String     | ID пользователя             |
+| role           | MemberRole | ORGANIZER, PARTICIPANT      |
+| joinedAt       | DateTime   | Дата присоединения          |
+
+Уникальность: каждая пара `(sessionId, userId)` — уникальна.
+
+### Comment
+| Поле           | Тип      | Описание                    |
+|----------------|----------|-----------------------------|
+| id             | String   | Уникальный идентификатор    |
+| ideaId         | String   | ID идеи                     |
+| userId         | String   | ID автора комментария       |
+| text           | String   | Текст комментария           |
+| createdAt      | DateTime | Дата создания               |
+
+## Система голосования
+
+### Механизм
+
+Голосование реализовано через сервис [`votingService`](server/src/services/votingService.ts:1) с полной валидацией и атомарными операциями. Каждый голос проходит через следующие проверки:
+
+1. **Принадлежность идеи сессии** — идея должна принадлежать текущей сессии (`IDEA_NOT_FOUND`)
+2. **Членство пользователя** — пользователь должен быть участником сессии (`NOT_A_MEMBER`)
+3. **Этап сессии** — голосование доступно только на этапах `VOTING_ROUND_1` и `FINAL_VOTE` (`VOTING_NOT_ALLOWED`)
+4. **Лимит голосов** — определяется через `session.config.voteLimit` (по умолчанию 3). На этапе `FINAL_VOTE` лимит равен 1 (`LIMIT_EXCEEDED`)
+5. **Уникальность голоса** — повторное голосование за ту же идею запрещено (`ALREADY_VOTED`)
+6. **Атомарное сохранение** — голос создаётся через `prisma.$transaction()` для гарантии целостности
+
+### Этапы голосования
+
+| Этап             | Лимит голосов | Описание                              |
+|------------------|---------------|---------------------------------------|
+| `VOTING_ROUND_1` | `config.voteLimit` (по умолч. 3) | Первый раунд голосования за идеи     |
+| `FINAL_VOTE`     | 1             | Финальное голосование за финалистов   |
+
+### WebSocket сообщения голосования
+
+#### Клиент → Сервер
+
+| Событие      | Payload               | Описание                   |
+|--------------|-----------------------|----------------------------|
+| `cast_vote`  | `{ ideaId: string }`  | Подать голос за идею       |
+
+#### Сервер → Клиент
+
+| Событие          | Payload                            | Описание                                     |
+|------------------|------------------------------------|----------------------------------------------|
+| `vote_updated`   | `{ ideaId: string, votesCount: number }` | Обновление счётчика голосов (broadcast всем в комнате) |
+| `vote_rejected`  | `{ code: string, message: string }` | Отклонение голоса (только клиенту)            |
+
+### Коды ошибок голосования
+
+| Код                   | Описание                                          |
+|-----------------------|---------------------------------------------------|
+| `IDEA_NOT_FOUND`      | Идея не принадлежит текущей сессии                |
+| `NOT_A_MEMBER`        | Пользователь не является участником сессии        |
+| `VOTING_NOT_ALLOWED`  | Голосование недоступно на текущем этапе сессии    |
+| `LIMIT_EXCEEDED`      | Превышен лимит голосов для текущего этапа         |
+| `ALREADY_VOTED`       | Пользователь уже голосовал за эту идею            |
+
+### Обработчик WebSocket
+
+Обработчик [`handleVote()`](server/src/ws/handlers.ts:1) выполняет следующие действия:
+
+1. Вызывает `votingService.castVote(userId, sessionId, ideaId)`
+2. **При успехе**: отправляет `vote_updated` с обновлённым счётчиком голосов всем участникам комнаты (broadcast)
+3. **При ошибке**: отправляет `vote_rejected` с кодом ошибки только клиенту, подалшему голос
+
+### Типы сообщений
+
+Определены в [`shared/types.ts`](shared/types.ts:1):
 
 ```typescript
-// Отправка события всем участникам сессии
-fastify.io.to(sessionId).emit('idea_added', idea);
+// Исходящие сообщения
+interface VoteUpdatedPayload {
+  ideaId: string;
+  votesCount: number;
+}
+
+interface VoteRejectedPayload {
+  code: string;
+  message: string;
+}
+
+// Входящие сообщения
+interface CastVotePayload {
+  ideaId: string;
+}
 ```
 
-### Утилиты
+## Управление этапами сессии (Stage Machine)
 
-- [`password.ts`](server/src/utils/password.ts) — `hashPassword()` и `comparePassword()` на bcryptjs
+Сессия проходит через последовательные этапы: `DISCUSSION → VOTING_ROUND_1 → REFINEMENT → FINAL_VOTE → COMPLETED`.
 
-### Схемы валидации (Zod)
+Реализовано в сервисе [`stageMachine`](server/src/services/stageMachine.ts:1).
 
-- [`auth.schema.ts`](server/src/schemas/auth.schema.ts) — RegisterSchema, LoginSchema
+### Переход между этапами
 
-## Клиент
+**Ручной переход (организатор):**
+```
+POST /sessions/:id/advance
+Body: { targetStage?: string }  // опционально, по умолчанию следующий этап
+```
 
-### Зависимости
-- React 18
-- Vite 5
-- socket.io-client (WebSocket коммуникация)
-- TypeScript
+**Автоматический переход:** при истечении `stageDeadline` сервер автоматически переходит к следующему этапу (проверка каждые 30 секунд).
 
-### Компоненты
+### Логика переходов
 
-#### SessionPage ([`client/src/pages/SessionPage.tsx`](client/src/pages/SessionPage.tsx))
-Основная страница сессии мозгового штурма.
-- Отображает grid карточек идей (IdeaCard)
-- Форма добавления новой идеи (поля: title, content)
-- Загрузка идей с сервера при монтировании (GET /api/sessions/:id/ideas)
-- Отправка новой идеи на сервер (POST /api/sessions/:id/ideas)
-- Подключение к Socket.IO для получения событий в реальном времени
-- Оптимистичное обновление счётчика голосов при голосовании
-- Откат счётчика при отклонении голоса (`vote_rejected`)
-- Отображение доступного лимита голосов
+| Переход | Действие |
+|---------|----------|
+| DISCUSSION → VOTING_ROUND_1 | Установка deadline для голосования |
+| VOTING_ROUND_1 → REFINEMENT | Топ-N идей по голосам получают статус `FINALIST` |
+| REFINEMENT → FINAL_VOTE | Установка deadline для финального голосования |
+| FINAL_VOTE → COMPLETED | Выбор победителя (финалист с макс. голосами), завершение сессии |
 
-#### IdeaCard ([`client/src/components/IdeaCard.tsx`](client/src/components/IdeaCard.tsx))
-Карточка отдельной идеи.
-- Пропсы: `idea` (id, title, content, voteCount, hasVoted), `onVote` (callback), `isVoteDisabled` (boolean)
-- Отображает заголовок, текст, счётчик голосов и кнопку "Голосовать"
-- Кнопка disabled если голос уже использован или лимит исчерпан
+### WebSocket события
 
-#### SessionContainer ([`client/src/pages/SessionContainer.tsx`](client/src/pages/SessionContainer.tsx))
-Обёрточный компонент для управления этапами сессии.
-- Загружает текущий этап (`currentStage`) при монтировании через `GET /api/sessions/:id`
-- Периодически обновляет этап (polling каждые 5 секунд)
-- Рендерит соответствующую страницу в зависимости от `currentStage`:
-  - **DISCUSSION / VOTING_ROUND_1** → [`SessionPage`](client/src/pages/SessionPage.tsx)
-  - **REFINEMENT** → [`RefinementPage`](client/src/pages/RefinementPage.tsx)
-  - **FINAL_VOTE** → [`FinalVotePage`](client/src/pages/FinalVotePage.tsx)
-  - **COMPLETED** → страница «Голосование завершено!»
-- Получает уведомления о смене этапа от дочерних компонентов через callback `onStageChange` (событие Socket.IO `stage_advanced`)
+При каждом переходе отправляется событие `stage_changed`:
+```json
+{
+  "type": "stage_changed",
+  "currentStage": "VOTING_ROUND_1",
+  "stageDeadline": "2024-01-01T12:00:00Z"
+}
+```
 
-#### RefinementPage ([`client/src/pages/RefinementPage.tsx`](client/src/pages/RefinementPage.tsx))
-Страница для этапа REFINEMENT (уточнение идей-финалистов).
-- Загружает идеи со статусом FINALIST
-- Позволяет редактировать title и content для каждой карточки
-- Сохраняет изменения через `PATCH /api/sessions/:sessionId/ideas/:ideaId`
-- Отображает обратный отсчёт до конца этапа
+### Режим ASYNC
 
-#### FinalVotePage ([`client/src/pages/FinalVotePage.tsx`](client/src/pages/FinalVotePage.tsx))
-Страница для этапа FINAL_VOTE (финальное голосование).
-- Загружает финалистов через `GET /api/sessions/:sessionId/finalists`
-- Позволяет проголосовать за одну идею (1 голос на пользователя)
-- Голосование через `POST /api/sessions/:sessionId/vote`
-- Отображает обратный отсчёт до конца этапа
+Для асинхронного режима используются абсолютные дедлайны из `config.perStageDeadlines` вместо относительных длительностей.
 
-### Хуки
+## Переменные окружения
 
-#### useSocket ([`client/src/hooks/useSocket.ts`](client/src/hooks/useSocket.ts))
-Кастомный хук для управления Socket.IO подключением.
-- Параметры: `sessionId`, `token`, колбэки `onVoteUpdated`, `onVoteRejected`, `onJoined`, `onError`
-- Автоматически подключается к серверу и присоединяется к сессии (`join_session`)
-- Подписывается на события: `vote_updated`, `vote_rejected`, `joined`, `error`
-- Возвращает метод `castVote(ideaId, callback)` для отправки голоса
-- Автоматически отключается при размонтировании компонента
+| Переменная               | Описание                                  | Пример                              |
+|--------------------------|-------------------------------------------|-------------------------------------|
+| `DATABASE_URL`           | Строка подключения к PostgreSQL           | `postgresql://user:pass@localhost:5432/brain_storm` |
+| `REDIS_URL`              | Строка подключения к Redis                | `redis://localhost:6379`            |
+| `JWT_ACCESS_SECRET`      | Секрет для подписи access-токена          | `change-me-access`                  |
+| `JWT_REFRESH_SECRET`     | Секрет для подписи refresh-токена         | `change-me-refresh`                 |
+| `JWT_ACCESS_EXPIRES_IN`  | Срок действия access-токена               | `15m`                               |
+| `JWT_REFRESH_EXPIRES_IN` | Срок действия refresh-токена              | `7d`                                |
+| `PORT`                   | Порт сервера                              | `3000`                              |
+| `NODE_ENV`               | Окружение (development / production)      | `development`                       |
+| `LLAMA_BASE_URL`         | URL OpenAI-совместимого API (Qwen)        | `http://localhost:8080/v1`          |
+| `LLAMA_API_KEY`          | API ключ для LLM                          | `your-api-key`                      |
+| `LLAMA_MODEL`            | Название модели (по умолчанию `qwen`)     | `qwen`                              |
 
-### Оптимистичное обновление голосов
-1. При нажатии "Голосовать" счётчик сразу увеличивается локально
-2. Через Socket.IO отправляется событие `cast_vote`
-3. При получении `vote_updated` (успех) — устанавливается реальное значение с сервера
-4. При получении `vote_rejected` (отказ) — счётчик откатывается к предыдущему значению
+> **Примечание:** Также поддерживаются переменные с префиксом `OPENAI_` (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`).
 
-### App.tsx ([`client/src/App.tsx`](client/src/App.tsx))
-- Стартовая страница с формой ввода ID сессии и JWT токена
-- После заполнения — переход на SessionContainer
-- SessionContainer управляет переключением страниц в зависимости от текущего этапа сессии
-- Передаёт sessionId и token как пропсы в SessionContainer
+## Миграция БД
 
-### Запуск
+После обновления примените миграцию:
 
 ```bash
-# Установка зависимостей
-npm install
-
-# Запуск клиента в dev-режиме
-npm --workspace=@brain-storm/client run dev
+cd server && npx prisma migrate dev --name add_idea_fields
 ```
 
-## Тестирование
+## Фронтенд
 
-Для тестирования используется Vitest.
+Клиентское приложение на **React 18** + **TypeScript** + **Vite**, стилизация через **Tailwind CSS** с кастомной дизайн-системой.
 
-### Запуск тестов
+### Структура клиента
+
+```
+client/
+├── src/
+│   ├── main.tsx                 # Точка входа React + роутинг
+│   ├── index.css                # Tailwind CSS
+│   ├── types.ts                 # Реэкспорт типов из shared/types.ts
+│   ├── api/
+│   │   ├── auth.ts              # API-клиент для аутентификации
+│   │   └── sessions.ts          # API-клиент для сессий
+│   ├── context/
+│   │   └── AuthContext.tsx      # React Context для состояния авторизации
+│   ├── components/
+│   │   ├── ui/                  # Примитивы (Button, Card, Input, Badge, Avatar)
+│   │   ├── sessions/            # Компоненты дашборда
+│   │   │   └── SessionCard.tsx  # Карточка сессии
+│   │   └── wizard/              # 4-шаговый визард создания сессии
+│   │       ├── Step1TopicMode.tsx   # Тема и режим
+│   │       ├── Step2Stages.tsx      # Длительность этапов
+│   │       ├── Step3Voting.tsx      # Настройки голосования
+│   │       └── Step4Invite.tsx      # Обзор и ссылка приглашения
+│   └── pages/
+│       ├── LandingPage.tsx      # Лендинг (страница /)
+│       ├── AuthPage.tsx         # Страница авторизации (/auth)
+│       ├── DashboardPage.tsx    # Дашборд организатора (/dashboard)
+│       └── CreateSessionWizard.tsx # Визард создания сессии (/create-session)
+├── vite.config.ts               # Настройка Vite + прокси API
+├── tailwind.config.js           # Настройка Tailwind (семантические токены)
+└── package.json
+```
+
+### Страницы
+
+| Маршрут          | Название              | Описание                                                                 |
+|------------------|-----------------------|--------------------------------------------------------------------------|
+| `/`              | Лендинг               | Hero с заголовком, 3 карточки преимуществ, кнопка «Создать сессию»       |
+| `/auth`          | Авторизация           | Табы Вход / Регистрация, валидация полей, cookie-based auth              |
+| `/dashboard`     | Дашборд               | Фильтры-табы (Активные/Завершённые/Черновики), сетка SessionCard         |
+| `/create-session`| Визард создания сессии| 4 шага с индикатором прогресса, автосохранением черновика в localStorage |
+
+### Дашборд организатора
+
+Дашборд ([`DashboardPage.tsx`](client/src/pages/DashboardPage.tsx:1)) содержит:
+
+- **Фильтры-табы** — Активные / Завершённые / Черновики
+- **Сетка карточек** ([`SessionCard.tsx`](client/src/components/sessions/SessionCard.tsx:1)):
+  - Тема сессии, бейдж режима, статус
+  - Для активных: текущий этап и количество онлайн-участников
+  - Для завершённых: превью лучшей идеи с количеством голосов
+  - Кнопки: Открыть, Скопировать ссылку, Дублировать
+- **Пустое состояние** — иконка + текст + кнопка «Создать сессию»
+- **Состояния UI**: loading (скелетоны), error (сообщение + «Повторить»), empty
+
+### Визард создания сессии
+
+4-шаговый визард ([`CreateSessionWizard.tsx`](client/src/pages/CreateSessionWizard.tsx:1)) с:
+
+- **Индикатором прогресса** — пронумерованные шаги с соединительными линиями
+- **Автосохранением черновика** в localStorage (debounce 500мс)
+- **Восстановлением черновика** после перезагрузки страницы
+- **Валидацией** на каждом шаге — кнопка «Далее» disabled пока шаг невалиден
+
+| Шаг | Компонент | Описание |
+|-----|-----------|----------|
+| 1 | [`Step1TopicMode.tsx`](client/src/components/wizard/Step1TopicMode.tsx:1) | Тема (мин. 3 символа) и выбор режима (QUICK/TEAM/ASYNC/PERSONAL) |
+| 2 | [`Step2Stages.tsx`](client/src/components/wizard/Step2Stages.tsx:1) | Длительность этапов; для ASYNC — дополнительные поля date/time |
+| 3 | [`Step3Voting.tsx`](client/src/components/wizard/Step3Voting.tsx:1) | Лимит голосов, количество финалистов, предпросмотр сценария |
+| 4 | [`Step4Invite.tsx`](client/src/components/wizard/Step4Invite.tsx:1) | Сводка настроек, ссылка для приглашения, кнопка создания |
+
+### Запуск клиента
 
 ```bash
-# Тесты для shared
-npm run test --workspace=shared
+# 1. Установите зависимости
+cd client && npm install
 
-# Тесты для server
-npm run test --workspace=server
-
-# Тесты для client
-npm run test --workspace=client
+# 2. Запустите dev-сервер
+npm run dev
 ```
 
-### Результаты
+Клиент будет доступен по адресу `http://localhost:5173`.
 
-- **shared**: 15 тестов (проверка типов и интерфейсов)
-- **server**: 36 тестов (схемы валидации, плагины CORS и аутентификации, утилиты паролей)
-- **client**: 17 тестов (компонент IdeaCard, хук useSocket)
+### Прокси API
 
-### Тестирование в watch-режиме
+Vite проксирует все запросы `/api/*` на сервер `http://localhost:3000`. Это позволяет обращаться к API без проблем с CORS при разработке.
 
-```bash
-# Сервер
-npm run test:watch --workspace=server
-
-# Клиент
-npm run test:watch --workspace=client
-
-# Shared
-npm run test:watch --workspace=shared
+В [`vite.config.ts`](client/vite.config.ts:1):
+```typescript
+server: {
+  proxy: {
+    '/api': {
+      target: 'http://localhost:3000',
+      changeOrigin: true,
+    },
+  },
+}
 ```
 
-## WebSocket — Server Time Sync
+## Аутентификация (клиент)
 
-Сервер отправляет событие `server_time` (Unix timestamp) при подключении клиента и каждые 10 секунд. Клиент вычисляет смещение между локальным и серверным временем для точного обратного отсчёта.
+### cookie-based подход
 
-### Таймер обратного отсчёта
+- Access-токен хранится в **httpOnly-cookie**, недоступен из JavaScript
+- Токены **не сохраняются в localStorage** — защита от XSS
+- Сессия восстанавливается автоматически при загрузке страницы через `GET /auth/me`
 
-На странице сессии отображается обратный отсчёт до `stageDeadline` с учётом смещения времени. Когда таймер доходит до нуля, клиент автоматически запрашивает актуальный статус сессии (`GET /sessions/:id/status`) для обновления данных.
+### Эндпоинты аутентификации
 
-### События WebSocket
+| Метод   | Путь              | Описание                                  |
+|---------|-------------------|-------------------------------------------|
+| POST    | `/auth/register`  | Регистрация нового пользователя           |
+| POST    | `/auth/login`     | Вход по email + пароль                    |
+| GET     | `/auth/me`        | Получить данные текущего пользователя     |
+| POST    | `/auth/logout`    | Выход (удаление refresh-токена)           |
 
-| Событие | Направление | Описание |
-|---------|------------|----------|
-| `server_time` | Server → Client | Unix timestamp сервера (мс) |
-| `stage_advanced` | Server → Client | Смена стадии с новым дедлайном |
+### Поток аутентификации
+
+1. **Регистрация / Вход** — пользователь заполняет форму на `/auth`, сервер возвращает токены в httpOnly-cookie
+2. **Восстановление сессии** — при загрузке приложения `AuthContext` вызывает `GET /auth/me` для проверки валидности сессии
+3. **Защищённые страницы** — `/dashboard` требует авторизации; неавторизованные пользователи перенаправляются на `/auth`
+4. **Редирект после входа** — пользователь перенаправляется на `/dashboard` или на страницу из параметра `?redirect=...`
+5. **Выход** — `POST /auth/logout` удаляет refresh-токен, клиент очищает локальное состояние
+
+### AuthContext
+
+Контекст [`AuthContext`](client/src/context/AuthContext.tsx:1) предоставляет:
+
+- `user` — данные текущего пользователя (или `null`)
+- `loading` — флаг загрузки при проверке сессии
+- `login(email, password)` — вход
+- `register(name, email, password)` — регистрация
+- `logout()` — выход
+- `checkAuth()` — проверка сессии через `GET /auth/me`
+
+## Компоненты комнаты сессии
+
+Страница комнаты сессии ([`SessionRoom.tsx`](client/src/pages/SessionRoom.tsx:1)) интегрирует набор специализированных компонентов для взаимодействия участников в реальном времени.
+
+### RoomHeader
+
+[`RoomHeader.tsx`](client/src/components/room/RoomHeader.tsx:1) — Sticky шапка комнаты сессии.
+
+- **Название сессии** — отображает тему мозгового штурма
+- **Индикатор этапа** — 5 шагов сессии (DISCUSSION → VOTING_ROUND_1 → REFINEMENT → FINAL_VOTE → COMPLETED) с подсветкой текущего
+- **Таймер** — обратный отсчёт до конца этапа через хук [`useServerTimer`](client/src/hooks/useServerTimer.ts:1)
+- **Аватары онлайн-пользователей** — группа аватаров с подсчётом участников
+- **Кнопка «Поделиться»** — копирование ссылки-приглашения
+- **Dropdown управления этапом** — доступен только организатору, позволяет вручную перейти к следующему этапу
+
+### IdeaCard
+
+[`IdeaCard.tsx`](client/src/components/room/IdeaCard.tsx:1) — Карточка идеи с полной информацией и интерактивным голосованием.
+
+- **Заголовок и описание** — описание сворачивается при большой длине
+- **Автор** — аватар и имя автора идеи
+- **Счётчик голосов** — текущее количество голосов с иконкой
+- **Группа аватаров проголосовавших** — визуальное представление участников голосования
+- **Иконка комментариев** — отображение количества обсуждений
+- **Кнопка голосования** — с адаптивным поведением: в этапе FINAL_VOTE отображается «Выбрать», в остальных этапах — стандартное голосование
+- **Бейджи статусов** — FINALIST и SELECTED отображаются соответствующими бейджами
+- **Оптимизация** — обёрнута в React.memo + useCallback для предотвращения лишних рендеров
+
+### IdeaFeed
+
+[`IdeaFeed.tsx`](client/src/components/room/IdeaFeed.tsx:1) — Сетка карточек идей с сортировкой.
+
+- **Адаптивная сетка** — 2 колонки на десктопе, 1 на мобильных
+- **Сортировка** — по голосам (по убыванию), по времени (новые сверху), мои идеи, финалисты
+- **Пустое состояние** — информативное сообщение когда идей нет
+- **Интеграция с IdeaCard** — рендерит карточки идей
+
+### AddIdeaForm
+
+[`AddIdeaForm.tsx`](client/src/components/room/AddIdeaForm.tsx:1) — Форма добавления новой идеи.
+
+- **Свёрнутое/развёрнутое состояние** — компактный ввод заголовка, разворачивается для полного описания
+- **Активна только в этапе DISCUSSION** — заблокирована в других этапах с пояснением
+- **Публикация** — отправка через WebSocket, очистка формы после успеха
+- **Тост уведомления** — уведомление об успешном добавлении идеи
+
+### VotesPanel
+
+[`VotesPanel.tsx`](client/src/components/room/VotesPanel.tsx:1) — Панель отображения оставшихся голосов пользователя.
+
+- **Отображение лимита** — показывает "Осталось X из Y" с визуальным индикатором из точек
+- **Индикатор исчерпания** — при отсутствии голосов панель становится серой с подсказкой
+- **Синхронизация с сервером** — обновляется через WebSocket события `vote_updated` и `vote_rejected`
+- **Откат при ошибке** — при получении `vote_rejected` счётчик голосов возвращается к предыдущему значению
+
+### LeadersPanel
+
+[`LeadersPanel.tsx`](client/src/components/room/LeadersPanel.tsx:1) — Панель топ-5 идей по количеству голосов.
+
+- **Рейтинг с медалями** — первые три места отмечены 🥇🥈🥉
+- **Интерактивная навигация** — клик на идею скроллит к соответствующей карточке с подсветкой
+- **Динамическое обновление** — рейтинг автоматически пересчитывается при изменении голосов
+
+### CommentsThread
+
+[`CommentsThread.tsx`](client/src/components/room/CommentsThread.tsx:1) — Поток комментариев под каждой карточкой идеи.
+
+- **Раскрывающийся/сворачиваемый блок** — компактное отображение с кнопкой раскрытия
+- **Оптимистичное добавление** — комментарий мгновенно появляется в списке через `useOptimisticMutation`
+- **Откат при ошибке** — при ошибке сервера комментарий удаляется из списка с тостом об ошибке
+- **Отправка по Ctrl+Enter** — поддержка горячих клавиш для удобного ввода
+- **API** — POST `/api/ideas/:id/comments` для добавления комментариев
+
+## Архитектура实时更新
+
+### Оптимистичные обновления
+
+Клиент использует оптимистичное обновление UI для мгновенной обратной связи при голосовании:
+
+1. **Мгновенное обновление** — при голосовании счётчик увеличивается локально до ответа сервера
+2. **WebSocket подтверждение** — сервер отправляет `vote_updated` с актуальным счётчиком
+3. **Откат при ошибке** — при получении `vote_rejected` счётчик возвращается к предыдущему значению с отображением ошибки
+
+Реализовано в [`SessionRoom.tsx`](client/src/pages/SessionRoom.tsx:1) через состояние `pendingVotes` и обработчики WebSocket событий.
+
+### SessionSocketContext
+
+[`SessionSocketContext.tsx`](client/src/context/SessionSocketContext.tsx:1) — контекст управления WebSocket соединением с event emitter паттерном.
+
+- **Event emitter** — методы `on()` и `emit()` для типизированных WebSocket событий
+- **Подписка на события** — `vote_updated`, `vote_rejected`, `idea_created`, `stage_changed`, `online_users`
+- **Автоматическое переподключение** — при потере соединения
+- **Типизация** — строго типизированные payload для каждого события через интерфейсы из [`shared/types.ts`](shared/types.ts:1)
+
+### Поток голосования
+
+```
+Клиент → cast_vote (WebSocket)
+  ↓
+Сервер → валидация (votingService.castVote)
+  ↓
+  ✓ Успех → vote_updated (broadcast всем в комнате)
+  ✗ Ошибка → vote_rejected (только клиенту)
+  ↓
+Клиент → оптимистичное обновление / откат
+```
+
+### Хук useSessionSocket
+
+[`useSessionSocket.ts`](client/src/hooks/useSessionSocket.ts:1) — хук для подписки на WebSocket события в компонентах.
+
+- Присоединение к комнате сессии при монтировании
+- Автоматический выход при размонтировании
+- Обработка `session_state` для инициализации данных
+- Передача обработчиков событий через props
+
+## Новые компоненты
+
+### Этапы сессии (StageContent)
+
+Компонент [`StageContent`](client/src/components/room/StageContent.tsx:1) управляет контентом комнаты в зависимости от текущего этапа:
+
+| Этап | Поведение |
+|------|-----------|
+| **DISCUSSION** | Добавление идей активно, голосование отключено |
+| **VOTING_ROUND_1** | Голосование активно, добавление идей заблокировано |
+| **REFINEMENT** | Только финалисты, inline-редактирование (автор/организатор) |
+| **FINAL_VOTE** | Только финалисты, 1 голос на пользователя |
+| **COMPLETED** | Редирект на экран результата |
+
+### Inline-редактор идей (IdeaEditor)
+
+Компонент [`IdeaEditor`](client/src/components/room/IdeaEditor.tsx:1) позволяет inline-редактировать title и content идеи:
+
+- **Оптимистичное обновление** через PATCH /ideas/:id
+- **Индикатор «{имя} редактирует…»** через presence
+- **Горячие клавиши**: Cmd/Ctrl+Enter (сохранить), Esc (отмена)
+- **Доступен** только автору и организатору на этапе REFINEMENT
+
+### Экран результата сессии (SessionResult)
+
+Страница [`SessionResult`](client/src/pages/SessionResult.tsx:1) отображает итоги завершённой сессии:
+
+- **Крупная карточка победившей идеи**
+- **Чек-лист «Первые шаги»** с inline-добавлением
+- **Сводка**: участники, идеи, топ-3 с прогресс-барами
+- **Копирование итога** в Markdown
+- **Дублирование сессии**
+
+### API дополнения
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| PATCH | `/ideas/:id` | Обновление идеи (автор/организатор) |
+| GET | `/ideas?sessionId=` | Включает вложенные голоса |
+| GET | `/sessions/:id` | Детали сессии (идеи + голоса + участники) |
+
+## CollectFromChat — структурирование идей из чата
+
+Модалка [`CollectFromChatModal`](client/src/components/room/CollectFromChatModal.tsx:1) позволяет извлечь структурированные идеи из неструктурированного текста чата с помощью AI (LLM).
+
+### Workflow (3 шага)
+
+| Шаг | Описание |
+|-----|----------|
+| **1. Ввод текста** | Пользователь вставляет текст чата в текстовое поле (до 10 000 символов). Кнопка «Структурировать» отправляет запрос к LLM через `POST /ideas/from-chat`. |
+| **2. Предпросмотр** | LLM возвращает массив черновиков идей `{ title, description }`. Пользователь может удалить лишние идеи (кнопка 🗑️) и нажать «Добавить все». |
+| **3. Успех** | Все оставшиеся идеи создаются в сессии через `POST /ideas`. Модалка показывает сообщение об успешном добавлении с количеством созданных идей. |
+
+### API
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| POST | `/ideas/from-chat` | `{ chatText: string }` → `{ ideas: Array<{ title: string, description: string }> }` |
+
+Таймаут LLM-запроса: 5 секунд. При таймауте возвращается ошибка 504.
+
+### Доступность (a11y)
+
+Проект следует рекомендациям WCAG 2.1 AA:
+
+|Aspect|Реализация|
+|-------|----------|
+| **aria-live** | Динамические обновления (голоса, этапы, онлайн-пользователи) объявляются через `role="status"` и `aria-live="polite"` для скринридеров |
+| **aria-label** | Все интерактивные элементы (кнопки, поля ввода) имеют описательные `aria-label` для контекста |
+| **focus-visible** | Фокус-visible кольцо только при навигации с клавиатуры (не при клике мышью) через `:focus-visible` CSS-селектор |
+| **Контраст** | Минимальное соотношение контраста ≥ 4.5:1 для текста, ≥ 3:1 для UI-элементов (проверено через DevTools) |
+| **Клавиатурная навигация** | Все интерактивные элементы доступны через Tab/Shift+Tab, Enter/Space для активации, Esc для закрытия модалок |
+| **Fullscreen sheet на мобильных** | Модалки и панели на мобильных устройствах (< 768px) отображаются как fullscreen bottom-sheet с возможностью свайпа вниз для закрытия |
+
+### Новые компоненты
+
+| Компонент | Файл | Описание |
+|-----------|------|----------|
+| **DeadlinesBlock** | [`DeadlinesBlock.tsx`](client/src/components/room/DeadlinesBlock.tsx:1) | Блок дедлайнов для ASYNC-режима: отображает абсолютные даты/время для каждого этапа с иконками статуса (⏳ ожидание, ✅ завершён, 🕐 текущий). При просрочке — предупреждение с жёлтым бейджем. |
+| **NotesPanel** | [`NotesPanel.tsx`](client/src/components/room/NotesPanel.tsx:1) | Панель заметок для PERSONAL-режима: добавление/удаление заметок, сохранение в localStorage (ключ `storm-notes-{sessionId}`), иконка StickyNote. |
+| **CollectFromChatModal** | [`CollectFromChatModal.tsx`](client/src/components/room/CollectFromChatModal.tsx:1) | 3-шаговая модалка для структурирования идей из текста чата с помощью AI. Поддерживает удаление черновиков, клавиатурную навигацию (TrapFocus), aria-label. |

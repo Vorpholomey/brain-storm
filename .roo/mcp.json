@@ -1,5 +1,6 @@
 {
-	"mcpServers": {"playwright": {
+	"mcpServers": {
+		"playwright": {
 			"command": "npx",
 			"args": [
 				"-y",
@@ -9,7 +10,12 @@
 				"browser_take_screenshot",
 				"browser_navigate",
 				"browser_console_messages",
-				"browser_wait_for"
+				"browser_wait_for",
+				"browser_close",
+				"browser_fill_form",
+				"browser_click",
+				"browser_snapshot",
+				"browser_network_requests"
 			]
 		},
 		"context7": {
@@ -21,6 +27,20 @@
 			"alwaysAllow": [
 				"resolve-library-id",
 				"query-docs"
+			]
+		},
+		"shadcn-react": {
+			"command": "npx",
+			"args": [
+				"shadcn@latest",
+				"mcp"
+			]
+		},
+		"shadcn-vue": {
+			"command": "npx",
+			"args": [
+				"shadcn-vue@latest",
+				"mcp"
 			]
 		}
 	}

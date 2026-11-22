@@ -1,44 +1,61 @@
 import Fastify from 'fastify';
-import cookiePlugin from '@fastify/cookie';
-import prismaPlugin from './plugins/prisma';
-import jwtPlugin from './plugins/jwt';
-import corsPlugin from './plugins/cors';
-import socketIOPlugin from './plugins/socket.io';
-import authPlugin from './plugins/auth';
-import authRoutes from './routes/auth';
-import sessionRoutes from './routes/sessions';
-import ideasRoutes from './routes/ideas';
-import votesRoutes from './routes/votes';
+import fastifyCookie from '@fastify/cookie';
+import fastifyCors from '@fastify/cors';
+import { registerErrorHandler } from '@/middleware/errorHandler';
+import { registerAuthRoutes } from '@/routes/auth';
+import { registerSessionRoutes } from '@/routes/sessions';
+import { registerIdeaRoutes } from '@/routes/ideas';
+import { registerWebSocket } from '@/ws/socket';
+import { checkAndAdvanceExpiredStages } from '@/services/stageMachine';
+import { createLogger } from '@/lib/logger';
 
-const fastify = Fastify({ logger: true });
+const logger = createLogger({ module: 'server' });
 
-(async () => {
+async function bootstrap() {
+  const fastify = Fastify({
+    logger: false,
+  });
+
+  await fastify.register(fastifyCors, {
+    origin: /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/,
+    credentials: true,
+  });
+  await fastify.register(fastifyCookie);
+
+  registerErrorHandler(fastify);
+
+  // REST маршруты
+  await registerAuthRoutes(fastify);
+  await registerSessionRoutes(fastify);
+  await registerIdeaRoutes(fastify);
+
+  // WebSocket
+  await registerWebSocket(fastify);
+
+  const port = Number(process.env.PORT) ?? 3000;
+
   try {
-    // Базовые плагины
-    await fastify.register(corsPlugin);
-    await fastify.register(cookiePlugin);
-    await fastify.register(prismaPlugin);
-    await fastify.register(jwtPlugin);
-
-    // Socket.IO (до роутов, чтобы io был доступен)
-    await fastify.register(socketIOPlugin);
-
-    // Публичные роуты (без auth middleware)
-    await fastify.register(authRoutes, { prefix: '/auth' });
-
-    // Health check
-    fastify.get('/health', async () => ({ status: 'ok' }));
-
-    // Защищённые роуты (требуют JWT)
-    await fastify.register(authPlugin);
-    await fastify.register(sessionRoutes, { prefix: '/sessions' });
-    await fastify.register(ideasRoutes, { prefix: '/sessions' });
-    await fastify.register(votesRoutes, { prefix: '/sessions' });
-
-    await fastify.listen({ port: 3000, host: '0.0.0.0' });
-    fastify.log.info('Сервер запущен на порту 3000');
-  } catch (err) {
-    fastify.log.error(err);
+    await fastify.listen({ port, host: '0.0.0.0' });
+    logger.info({ port }, 'Server started');
+  } catch (error) {
+    logger.fatal({ err: error }, 'Server failed to start');
     process.exit(1);
   }
-})();
+
+  // Таймер автоматического перехода по истечении дедлайна (каждые 30 сек)
+  const stageTimer = setInterval(() => {
+    checkAndAdvanceExpiredStages().catch((error) => {
+      logger.error({ err: error }, 'Stage timer error');
+    });
+  }, 30_000);
+
+  // Предотвращаем утечку памяти при graceful shutdown
+  process.on('SIGTERM', () => {
+    clearInterval(stageTimer);
+  });
+  process.on('SIGINT', () => {
+    clearInterval(stageTimer);
+  });
+}
+
+bootstrap();
